@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package inference;
+
+option go_package = "distributed-llm-inference-router/gen";
+
+service InferenceService {
+  rpc Infer(InferRequest) returns (InferResponse);
+  rpc InferStream(InferRequest) returns (stream TokenResponse);
+}
+
+message InferRequest {
+  string request_id   = 1;
+  repeated int32 prompt_tokens = 2;
+  int32 max_new_tokens = 3;
+}
+
+message InferResponse {
+  string request_id    = 1;
+  repeated int32 output_tokens = 2;
+  bool   cache_hit     = 3;
+  int64  prefill_tokens = 4;
+}
+
+message TokenResponse {
+  string request_id = 1;
+  int32  token      = 2;
+  bool   last       = 3;
+}
