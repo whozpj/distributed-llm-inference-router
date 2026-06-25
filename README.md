@@ -1,177 +1,113 @@
 # Distributed LLM Inference Router
 
-A multi-replica LLM serving system in Go that studies the tradeoff between KV-cache locality and load balance. Implements continuous batching per replica and benchmarks three routing policies — round-robin, least-outstanding-requests, and prefix-cache-aware — under identical traffic to produce trustworthy latency and throughput comparisons.
-
----
-
-## Motivation
-
-Two facts drive modern LLM serving performance:
-
-1. **Batching is where throughput comes from.** A GPU decoding one sequence at a time wastes most of its compute. Continuous batching — refilling the running batch every decode step rather than waiting for a static batch to drain — is the dominant throughput lever.
-
-2. **KV-cache reuse is where latency comes from.** When two requests share a prompt prefix (a shared system prompt, a RAG context), routing them to the same replica lets the second request skip recomputing the first's prefill. That reuse is only possible if the router is aware of what each replica has cached.
-
-These two objectives pull against each other. Routing for cache locality concentrates traffic on whichever replica is hot for a prefix, creating hotspots. Routing for load balance spreads traffic and discards cache reuse. This project measures that tradeoff rigorously, including the regimes where prefix-aware routing does not help.
-
----
+A simulated distributed LLM inference router benchmarking three routing policies under identical traffic. Built in Go with gRPC transport.
 
 ## Architecture
 
 ```
-                    ┌──────────────────┐
-   clients ────────▶│     Router       │
-   (load gen)       │                  │
-                    │  admission queue │
-                    │  routing policy  │
-                    │  prefix-cache map│
-                    │  health checks   │
-                    └────────┬─────────┘
-                             │ forwards requests
-             ┌───────────────┼───────────────┐
-             ▼               ▼               ▼
-       ┌──────────┐    ┌──────────┐    ┌──────────┐
-       │Replica 1 │    │Replica 2 │    │Replica 3 │
-       │          │    │          │    │          │
-       │ batcher  │    │ batcher  │    │ batcher  │
-       │ KV cache │    │ KV cache │    │ KV cache │
-       │  model   │    │  model   │    │  model   │
-       └──────────┘    └──────────┘    └──────────┘
-             │               │               │
-             └───────────────┴───────────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │     Metrics      │
-                    │ latency histograms│
-                    │ cache hit rates  │
-                    └──────────────────┘
+                        ┌─────────────────────────────────────────┐
+                        │              Router                      │
+  Load Generator ──────▶│  Policy: roundrobin | lor | prefixaware  │──▶ /metrics :9100
+                        │  Queue depth: 512  Workers: 8           │
+                        └────────────┬────────────────────────────┘
+                                     │ gRPC (InferenceService)
+                   ┌─────────────────┼─────────────────┐
+                   ▼                 ▼                 ▼
+            ┌────────────┐   ┌────────────┐   ┌────────────┐
+            │  Replica 0 │   │  Replica 1 │   │  Replica 2 │
+            │  Batcher   │   │  Batcher   │   │  Batcher   │
+            │  KV Cache  │   │  KV Cache  │   │  KV Cache  │
+            └────────────┘   └────────────┘   └────────────┘
 ```
 
-### Components
-
-| Component | Responsibility |
-|-----------|---------------|
-| **Router** | Receives requests, selects a replica via the active policy, forwards the request, streams the response back. Holds requests in a queue and applies backpressure when all replicas are saturated. |
-| **Replica** | Runs a batcher loop and a mock model. Maintains a simulated KV cache keyed by prompt prefix. Exposes queue depth and cache state to the router. |
-| **Batcher** | A single-goroutine loop that admits waiting requests into a running batch, advances every sequence one token per decode step, and evicts finished sequences. New arrivals join a batch already decoding on the next tick. |
-| **Mock model** | `latency = base + per_token × tokens`. Prefill cost scales with uncached prompt tokens, so a cache hit produces a measurably cheaper request. |
-| **Load generator** | Separate process producing bursty traffic with configurable prompt length distributions and prefix-overlap fraction. Overlap is a first-class experimental knob. |
-| **Metrics** | Prometheus-style counters and latency histograms. Source of all reported numbers. |
-
----
+Each replica runs a tick-based continuous batcher with an LRU KV cache (capacity: 2 prefixes). Routing policy determines which replica handles each request — and therefore whether the request hits a warm cache.
 
 ## Routing Policies
 
-All three policies implement a single interface, so they are swapped under identical traffic:
+| Policy | Strategy |
+|--------|----------|
+| `roundrobin` | Cycles through replicas evenly |
+| `lor` | Routes to the replica with fewest outstanding requests |
+| `prefixaware` | Routes to the replica that previously cached this prompt prefix; falls back to LOR |
 
-```go
-type Policy interface {
-    Pick(req *Request, replicas []*ReplicaClient) *ReplicaClient
-}
+## Simulation Parameters
+
+- **Prefill cost (cache miss):** 10ms per token — a 32-token prompt costs ~320ms prefill
+- **Prefill cost (cache hit):** 0ms — KV cache serves it instantly
+- **Decode cost:** 1ms per token
+- **KV cache per replica:** 2 slots (LRU eviction)
+- **Distinct prompt prefixes:** 6 (replicas can only cache 2, forcing eviction under round-robin)
+
+## Results
+
+`make bench` output (`--seed=42 --requests=200 --replicas=3`):
+
+```
+scenario        policy           count       p50       p90       p99    cache%
+----------------------------------------------------------------------
+cache-heavy     roundrobin         200     2.29s    3.958s     4.49s     25.5%
+cache-heavy     lor                200    2.179s     3.85s    4.166s     27.0%
+cache-heavy     prefixaware        200     868ms    1.327s    1.579s     61.0%
+cache-cold      roundrobin         200     3.62s    6.359s     6.93s      0.0%
+cache-cold      lor                200    3.617s    6.357s     6.93s      0.0%
+cache-cold      prefixaware        200    3.619s    6.359s     6.93s      0.0%
+bursty          roundrobin         200     4.47s    7.971s    8.759s      6.5%
+bursty          lor                200    4.465s     8.15s    8.829s      6.0%
+bursty          prefixaware        200    3.745s    6.762s    7.419s     22.5%
 ```
 
-| Policy | Strategy | Notes |
-|--------|----------|-------|
-| **Round-robin** | Cycles through replicas in order | Baseline; ignores load and cache state |
-| **Least-outstanding-requests** | Picks the replica with fewest in-flight requests | Good load balance; cache-blind |
-| **Prefix-cache-aware** | Scores replicas by load discounted by `localityWeight`; falls back to LOR when no hot replica exists or the best hot replica exceeds `hotspotThreshold` | Experimental surface: sweep the two knobs and observe the p99 / cache-hit-rate curve |
+**Key insight:** `prefixaware` routes same-prefix requests to the same replica, keeping its cache warm. `roundrobin` distributes them across all replicas, which can only hold 2 of 6 prefixes — causing frequent eviction and cold prefill costs.
 
-The `localityWeight` and `hotspotThreshold` knobs are the central experimental surface. The deliverable is the curve of p99 latency and cache hit rate as they vary, not a single tuned configuration.
-
----
-
-## Prefix Tracking
-
-A prefix hash (or radix tree over seen prefixes) maps `prefix → replicas currently hot for it`.
-
-Two correctness requirements that are easy to omit but critical to include:
-
-- **Eviction** — the prefix map is LRU-bounded. Without this it grows without limit.
-- **Decay** — a replica stops being "hot" for a prefix after idle time or cache pressure. Stale hotness silently degrades the cache hit rate, so decay is part of the design.
-
----
-
-## Continuous Batching
-
-Each replica's batcher runs one goroutine that owns all batch state. Every decode tick:
-
-1. **Admit** — pull from the waiting queue into the running batch up to `maxBatch` and a `tokenBudget`. Charge prefill cost only for the uncached portion of the prompt.
-2. **Step** — advance every running sequence by one token; stream it to the caller.
-3. **Evict** — remove finished sequences, free their working memory, and keep the prefix KV hot for future reuse.
-
-Admit runs every tick, so a request arriving mid-decode joins on the next tick instead of waiting for the batch to drain. That refill is the entire throughput win and is the headline result of Phase 1.
-
-Memory is capped on total tokens in flight (a proxy for KV memory) rather than request count, which is the honest model of GPU memory pressure when no real GPU is present.
-
----
-
-## Concurrency Model
-
-- One goroutine owns each batcher's state. No locks are needed on the hot path.
-- The router uses atomics for per-replica outstanding counts and an `RWMutex` for the prefix map.
-- Sharding a batch across goroutines with shared locks would trade clean latency numbers for race debugging. Clean measurement is a goal; the single-owner loop wins.
-
----
-
-## Benchmark Methodology
-
-- **Identical traffic across policies.** The same generated request stream is replayed per policy; otherwise comparisons are meaningless.
-- **Conditions reported with every number.** Request rate, prefix-overlap fraction, prompt-length distribution, replica count.
-- **Variance, not point estimates.** Each configuration is run multiple times; results report spread or confirm stability. A single run of a concurrent system is not evidence.
-- **Reproducible.** `make bench` regenerates all numbers from a fixed seed.
-
-### Traffic profiles
-
-| Profile | Prefix overlap | Expected winner |
-|---------|---------------|----------------|
-| Cache-heavy | High | Prefix-cache-aware |
-| Cache-cold | Near zero | Ties least-outstanding |
-| Bursty | Varied | Tests backpressure and autoscaling |
-
-### Metrics collected
-
-- p50 / p90 / p99 latency
-- Throughput (req/s and tokens/s)
-- Cache hit rate
-- Per-replica load distribution (to expose hotspots)
-
----
-
-## Limitations
-
-Stated up front because hiding them costs more credibility than naming them.
-
-| Limitation | What it means |
-|------------|--------------|
-| Simulated inference | No real model or GPU. Decode and prefill costs are modeled functions of token counts. The distributed-systems behavior under study — routing, batching, backpressure, scaling — is independent of whether the matrix multiplications are real. |
-| KV memory as token budget | A proxy for GPU memory pressure, not the real thing. |
-| Coarse prefix matching | Hash or radix tree over leading tokens, not a production prefix-cache implementation. |
-| Single machine | Router-to-replica fan-out over cheap local transport; no cross-host failures or partitions. |
-
-Each is a simplification of scope, not a flaw in the results. All policies run against the same model, so the measured tradeoffs hold.
-
----
-
-## Getting Started
+## How to Run
 
 ```bash
-# Build everything
-make build
-
-# Run the router and replicas
-make run
-
-# Run all benchmarks (fixed seed, reproducible)
+# Run the full benchmark
 make bench
+
+# Single scenario
+go run ./cmd/loadgen --scenario=cache-heavy --requests=200 --replicas=3
+
+# With Prometheus metrics (scrape during run)
+go run ./cmd/loadgen --scenario=cache-heavy --metrics-addr=:9100
 
 # Run tests
 make test
 ```
 
-> **Requirements:** Go 1.22+
+## Prometheus Metrics
 
----
+When running with `--metrics-addr=:9100`:
 
-## Project Status
+```bash
+curl http://localhost:9100/metrics | grep router_
+```
 
-`Draft` — actively in development. Phases 0–2 are the primary deliverable.
+Exposes:
+- `router_request_duration_seconds` — latency histogram, labeled by `policy`
+- `router_requests_total` — request count, labeled by `policy`
+- `router_cache_hits_total` — cache hit/miss counts, labeled by `policy` and `hit`
+
+## Project Structure
+
+```
+cmd/
+  loadgen/    # Benchmark runner (3 scenarios × 3 policies)
+  replica/    # Standalone replica binary
+  router/     # Standalone router binary
+loadgen/      # Load generator with multi-prefix support
+metrics/      # In-process p50/p90/p99 recorder
+replica/
+  batcher/    # Tick-based continuous batcher
+  cache/      # LRU KV cache with TTL
+  model/      # Mock model (prefill/decode cost simulation)
+  server/     # gRPC server wrapping the batcher
+router/
+  client.go         # ReplicaClient with outstanding-request tracking
+  observer.go       # Prometheus metrics
+  policy.go         # Policy interface
+  prefixaware.go    # Prefix-cache-aware policy
+  prefixmap.go      # LRU prefix→replica map with TTL
+  leastoutstanding.go
+  roundrobin.go
+  router.go         # Admission queue + dispatch workers
+```
