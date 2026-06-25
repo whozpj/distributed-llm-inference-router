@@ -48,6 +48,8 @@ func (r *ReplicaClient) Infer(ctx context.Context, req *pb.InferRequest) (*pb.In
 	return r.stub.Infer(ctx, req)
 }
 
+func (r *ReplicaClient) AddOutstanding(n int64) { r.outstanding.Add(n) }
+
 func (r *ReplicaClient) Close() error {
 	if r.conn == nil {
 		return nil
