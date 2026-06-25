@@ -26,12 +26,12 @@ var scenarios = []struct {
 	overlapFraction float64
 	targetRPS       float64
 }{
-	{"cache-heavy", 0.80, 50},
+	{"cache-heavy", 0.90, 50},
 	{"cache-cold", 0.05, 50},
 	{"bursty", 0.50, 200},
 }
 
-var policies = []struct {
+var policyFactories = []struct {
 	name    string
 	factory func(replicas []*router.ReplicaClient) router.Policy
 }{
@@ -51,17 +51,18 @@ var policies = []struct {
 	}},
 }
 
-func startReplica(tickInterval time.Duration) (string, func()) {
+func startReplica() (string, func()) {
 	m := model.New(model.Config{
-		Base:            5 * time.Millisecond,
-		PrefillPerToken: 2 * time.Millisecond,
+		Base:            0,
+		PrefillPerToken: 10 * time.Millisecond, // dramatic prefill cost
 		DecodePerToken:  1 * time.Millisecond,
 	})
-	kv := cache.New(1024, 5*time.Minute)
+	// Cache holds only 2 of 6 prefixes — forces eviction under round-robin.
+	kv := cache.New(2, 5*time.Minute)
 	b := batcher.New(batcher.Config{
 		MaxBatch:     8,
-		TokenBudget:  4096,
-		TickInterval: tickInterval,
+		TokenBudget:  8192,
+		TickInterval: 10 * time.Millisecond,
 		PrefixLen:    16,
 	}, m, kv)
 	b.Start()
@@ -81,7 +82,12 @@ func main() {
 	scenario := flag.String("scenario", "all", "scenario name or 'all'")
 	nReplicas := flag.Int("replicas", 3, "number of replicas")
 	totalReqs := flag.Int("requests", 200, "requests per run")
+	metricsAddr := flag.String("metrics-addr", ":9100", "Prometheus /metrics address; empty to disable")
 	flag.Parse()
+
+	if *metricsAddr != "" {
+		fmt.Printf("Prometheus metrics: http://localhost%s/metrics\n\n", *metricsAddr)
+	}
 
 	fmt.Printf("%-14s  %-12s  %8s  %8s  %8s  %8s  %8s\n",
 		"scenario", "policy", "count", "p50", "p90", "p99", "cache%")
@@ -91,11 +97,11 @@ func main() {
 		if *scenario != "all" && sc.name != *scenario {
 			continue
 		}
-		for _, pol := range policies {
+		for _, pol := range policyFactories {
 			addrs := make([]string, *nReplicas)
 			stops := make([]func(), *nReplicas)
 			for i := range addrs {
-				addrs[i], stops[i] = startReplica(5 * time.Millisecond)
+				addrs[i], stops[i] = startReplica()
 			}
 			replicas := make([]*router.ReplicaClient, *nReplicas)
 			for i, addr := range addrs {
@@ -107,7 +113,12 @@ func main() {
 			}
 
 			p := pol.factory(replicas)
-			rt := router.New(router.Config{QueueDepth: 512, RPCTimeout: 10 * time.Second}, replicas, p)
+			rt := router.New(router.Config{
+				QueueDepth:  512,
+				RPCTimeout:  30 * time.Second,
+				PolicyName:  pol.name,
+				MetricsAddr: *metricsAddr,
+			}, replicas, p)
 			rt.Start(8)
 
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -131,9 +142,10 @@ func main() {
 				TotalRequests:   *totalReqs,
 				OverlapFraction: sc.overlapFraction,
 				SharedPrefixLen: 16,
+				NumPrefixes:     6,
 				PromptLenMin:    20,
 				PromptLenMax:    64,
-				MaxNewTokens:    10,
+				MaxNewTokens:    5,
 			}, pb.NewInferenceServiceClient(conn), rec)
 
 			lg.Run(context.Background())
