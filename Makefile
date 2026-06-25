@@ -14,4 +14,4 @@ test: proto
 	go test ./... -race -count=1
 
 bench: build
-	go run ./cmd/loadgen --seed=42 --scenario=all
+	go run ./cmd/loadgen --seed=42 --scenario=all --requests=200 --replicas=3
