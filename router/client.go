@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	pb "distributed-llm-inference-router/gen"
@@ -31,7 +32,7 @@ func NewReplicaClient(id, addr string) (*ReplicaClient, error) {
 }
 
 func NewTestReplicaClient(index int) *ReplicaClient {
-	r := &ReplicaClient{index: index}
+	r := &ReplicaClient{index: index, id: fmt.Sprintf("test-replica-%d", index)}
 	r.healthy.Store(true)
 	return r
 }

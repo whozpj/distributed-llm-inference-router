@@ -34,8 +34,17 @@ func main() {
 	switch *policy {
 	case "roundrobin":
 		p = router.NewRoundRobin()
+	case "lor":
+		p = router.NewLeastOutstanding()
+	case "prefixaware":
+		pm := router.NewPrefixMap(4096, 5*time.Minute)
+		p = router.NewPrefixAware(router.PrefixAwareConfig{
+			PrefixLen:        16,
+			LocalityWeight:   1.0,
+			HotspotThreshold: 20,
+		}, pm, router.NewLeastOutstanding())
 	default:
-		log.Fatalf("unknown policy %q (lor and prefixaware added in later tasks)", *policy)
+		log.Fatalf("unknown policy %q", *policy)
 	}
 
 	rt := router.New(router.Config{QueueDepth: 256, RPCTimeout: 30 * time.Second}, replicas, p)
