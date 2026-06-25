@@ -25,7 +25,11 @@ func (pa *PrefixAware) Pick(req *Request, replicas []*ReplicaClient) *ReplicaCli
 	hash := HashPrefix(req.PromptTokens, pa.cfg.PrefixLen)
 	hotIDs, ok := pa.pm.Lookup(hash)
 	if !ok {
-		return pa.fallback.Pick(req, replicas)
+		r := pa.fallback.Pick(req, replicas)
+		if r != nil {
+			pa.pm.Record(hash, r.ID())
+		}
+		return r
 	}
 
 	hotSet := make(map[string]bool, len(hotIDs))
@@ -49,7 +53,11 @@ func (pa *PrefixAware) Pick(req *Request, replicas []*ReplicaClient) *ReplicaCli
 		}
 	}
 	if best == nil {
-		return pa.fallback.Pick(req, replicas)
+		r := pa.fallback.Pick(req, replicas)
+		if r != nil {
+			pa.pm.Record(hash, r.ID())
+		}
+		return r
 	}
 
 	pa.pm.Record(hash, best.ID())
