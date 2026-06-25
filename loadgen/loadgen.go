@@ -17,6 +17,7 @@ type Config struct {
 	TotalRequests   int
 	OverlapFraction float64
 	SharedPrefixLen int
+	NumPrefixes     int // number of distinct shared prefixes; <= 1 means single prefix
 	PromptLenMin    int
 	PromptLenMax    int
 	MaxNewTokens    int
@@ -31,9 +32,19 @@ type GeneratedRequest struct {
 func GenerateRequests(cfg Config) []GeneratedRequest {
 	rng := rand.New(rand.NewSource(cfg.Seed))
 
-	sharedPrefix := make([]int32, cfg.SharedPrefixLen)
-	for i := range sharedPrefix {
-		sharedPrefix[i] = int32(rng.Intn(1000) + 1)
+	numPrefixes := cfg.NumPrefixes
+	if numPrefixes < 1 {
+		numPrefixes = 1
+	}
+
+	// Build numPrefixes distinct shared prefixes.
+	prefixes := make([][]int32, numPrefixes)
+	for i := range prefixes {
+		p := make([]int32, cfg.SharedPrefixLen)
+		for j := range p {
+			p[j] = int32(rng.Intn(1000) + 1)
+		}
+		prefixes[i] = p
 	}
 
 	reqs := make([]GeneratedRequest, cfg.TotalRequests)
@@ -44,7 +55,8 @@ func GenerateRequests(cfg Config) []GeneratedRequest {
 		useShared := rng.Float64() < cfg.OverlapFraction
 		start := 0
 		if useShared && cfg.SharedPrefixLen <= length {
-			copy(tokens, sharedPrefix)
+			prefix := prefixes[rng.Intn(numPrefixes)]
+			copy(tokens, prefix)
 			start = cfg.SharedPrefixLen
 		}
 		for j := start; j < length; j++ {

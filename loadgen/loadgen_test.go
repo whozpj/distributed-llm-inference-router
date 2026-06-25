@@ -56,3 +56,41 @@ func TestOverlapFractionProducesSharedPrefixes(t *testing.T) {
 		}
 	}
 }
+
+func TestMultiPrefixProducesDifferentPrefixes(t *testing.T) {
+	cfg := loadgen.Config{
+		Seed:            1,
+		TotalRequests:   300,
+		OverlapFraction: 1.0,
+		SharedPrefixLen: 4,
+		NumPrefixes:     3,
+		PromptLenMin:    10,
+		PromptLenMax:    10,
+		MaxNewTokens:    1,
+	}
+	reqs := loadgen.GenerateRequests(cfg)
+	if len(reqs) != 300 {
+		t.Fatalf("got %d requests, want 300", len(reqs))
+	}
+	// With 3 distinct prefixes and OverlapFraction=1.0, not all requests
+	// should start with the same 4 tokens.
+	first := make([]int32, 4)
+	copy(first, reqs[0].PromptTokens[:4])
+	allSame := true
+	for _, r := range reqs[1:] {
+		diff := false
+		for j, tok := range r.PromptTokens[:4] {
+			if tok != first[j] {
+				diff = true
+				break
+			}
+		}
+		if diff {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		t.Fatal("all 300 requests have identical prefix — NumPrefixes=3 not working")
+	}
+}
