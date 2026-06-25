@@ -17,6 +17,7 @@ func main() {
 	addr := flag.String("addr", ":50050", "listen address")
 	replicaAddrs := flag.String("replicas", ":50051,:50052", "comma-separated replica addresses")
 	policy := flag.String("policy", "roundrobin", "roundrobin | lor | prefixaware")
+	metricsAddr := flag.String("metrics-addr", ":9100", "Prometheus metrics address; empty to disable")
 	flag.Parse()
 
 	addrs := strings.Split(*replicaAddrs, ",")
@@ -47,7 +48,12 @@ func main() {
 		log.Fatalf("unknown policy %q", *policy)
 	}
 
-	rt := router.New(router.Config{QueueDepth: 256, RPCTimeout: 30 * time.Second}, replicas, p)
+	rt := router.New(router.Config{
+		QueueDepth:  256,
+		RPCTimeout:  30 * time.Second,
+		PolicyName:  *policy,
+		MetricsAddr: *metricsAddr,
+	}, replicas, p)
 	rt.Start(8)
 	defer rt.Stop()
 
@@ -57,6 +63,6 @@ func main() {
 	}
 	gs := grpc.NewServer()
 	pb.RegisterInferenceServiceServer(gs, rt)
-	log.Printf("router listening on %s (policy=%s)", *addr, *policy)
+	log.Printf("router listening on %s (policy=%s, metrics=%s)", *addr, *policy, *metricsAddr)
 	gs.Serve(lis)
 }
